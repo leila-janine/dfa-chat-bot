@@ -1,4 +1,4 @@
-import gradio as gr
+import streamlit as st
 import faiss
 import json
 import os
@@ -8,25 +8,26 @@ from huggingface_hub import InferenceClient
 # ==========================================
 # 1. INITIALIZE MODELS & API
 # ==========================================
-# Read the secret token from the environment (we will set this in the cloud)
-hf_token = os.environ.get("HF_TOKEN")
-client = InferenceClient(token=hf_token)
-
-# Load lightweight embedding model
-embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-# Load database files
-try:
+@st.cache_resource
+def load_resources():
+    # Streamlit Cloud uses st.secrets instead of os.environ
+    hf_token = st.secrets["HF_TOKEN"]
+    client = InferenceClient(token=hf_token)
+    
+    # Small embedding model
+    embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    
+    # Load files
     with open("dfa_chunks.json", "r", encoding="utf-8") as f:
         chunks = json.load(f)
     index = faiss.read_index("dfa_faiss.index")
-    db_loaded = True
-except Exception as e:
-    db_loaded = False
-    error_msg = str(e)
+    
+    return chunks, index, embed_model, client
+
+chunks, index, embed_model, client = load_resources()
 
 # ==========================================
-# 2. RETRIEVAL LOGIC
+# 2. RAG LOGIC (Same as your Gradio version)
 # ==========================================
 def retrieve(query, k=3):
     q_emb = embed_model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
@@ -37,30 +38,16 @@ def retrieve(query, k=3):
         results.append({**c, "score": float(score)})
     return results
 
-# ==========================================
-# 3. GENERATION & CHAT LOGIC
-# ==========================================
-def respond(message, history):
-    if not db_loaded:
-        return f"🚨 Database failed to load. Please check your files. Error: {error_msg}"
-        
-    if not message.strip():
-        return "⚠️ Please enter a valid question."
+def generate_answer(message, hits):
+    MIN_SCORE = 0.45 
+    if not hits or hits[0]["score"] < MIN_SCORE:
+        return "I don't know based on the provided PDFs. The requested information is not in the DFA manual.", None
     
-    try:
-        # 1. Retrieve Documents
-        hits = retrieve(message, k=3)
-        MIN_SCORE = 0.45 
-        if not hits or hits[0]["score"] < MIN_SCORE:
-            return "I don't know based on the provided PDFs. The requested information is not in the DFA manual."
-        
-        # 2. Format Context
-        context_text = "\n\n".join(
-            [f"[{i+1}] (Source: {h['source']}, page {h['page']}) {h['text']}" for i, h in enumerate(hits)]
-        )
-        
-        # 3. Strict Phi-3 Prompt Template
-        prompt = f"""<|system|>
+    context_text = "\n\n".join(
+        [f"[{i+1}] (Source: {h['source']}, page {h['page']}) {h['text']}" for i, h in enumerate(hits)]
+    )
+    
+    prompt = f"""<|system|>
 You are a strict document-based question-answering system. Use ONLY the context provided to answer.
 Provide a direct, concise answer. If the info is missing, say you don't know.
 STOP immediately after answering.<|end|>
@@ -70,38 +57,51 @@ Context:
 
 Question: {message}<|end|>
 <|assistant|>"""
-              
-        # 4. Call Hugging Face API
-        response = client.text_generation(
-            prompt, 
-            model="microsoft/Phi-3-mini-4k-instruct",
-            max_new_tokens=250, 
-            return_full_text=False
-        )
-        
-        # 5. Clean up Answer
-        answer = response.strip()
-        answer = answer.split("Question:")[0].split("<|user|>")[0].split("Answer:")[0].strip()
-        
-        # 6. Append Context for Grading Rubric
-        context_display = "\n\n---\n**🔍 Retrieved Context & Citations:**\n"
-        for i, h in enumerate(hits, 1):
-            context_display += f"* **[{i}] {h['source']} (Page {h['page']})** | Similarity: {h['score']:.3f}\n> {h['text']}\n\n"
+          
+    response = client.text_generation(
+        prompt, 
+        model="microsoft/Phi-3-mini-4k-instruct",
+        max_new_tokens=250, 
+        return_full_text=False
+    )
+    
+    answer = response.strip().split("Question:")[0].split("<|user|>")[0].split("<|end|>")[0]
+    return answer, hits
+
+# ==========================================
+# 3. STREAMLIT UI
+# ==========================================
+st.set_page_config(page_title="DFA RAG Chatbot", page_icon="📜")
+st.title("📜 DFA Operations Manual Chatbot")
+
+# Initialize chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# User Input
+if prompt := st.chat_input("Ask about the DFA manual..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        try:
+            hits = retrieve(prompt)
+            answer, raw_hits = generate_answer(prompt, hits)
+            st.markdown(answer)
             
-        return answer + context_display
-        
-    except Exception as e:
-        return f"❌ An API or connection error occurred: {str(e)}"
-
-# ==========================================
-# 4. BUILD GRADIO UI
-# ==========================================
-demo = gr.ChatInterface(
-    fn=respond,
-    title="📜 DFA Operations Manual Chatbot",
-    description="Ask procedural and policy questions based on the DFA Authentication Division Operations Manual.",
-    theme="soft"
-)
-
-if __name__ == "__main__":
-    demo.launch()
+            # Bonus: Show citations in an expander
+            if raw_hits:
+                with st.expander("🔍 View Sources"):
+                    for h in raw_hits:
+                        st.write(f"**{h['source']} (Page {h['page']})** - Score: {h['score']:.3f}")
+                        st.caption(h['text'])
+            
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+        except Exception as e:
+            st.error(f"Error: {e}")
